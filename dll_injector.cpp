@@ -1,126 +1,99 @@
 #include <iostream>
-#include <sys/ptrace.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dlfcn.h>
-#include <cstring>
-#include <sys/wait.h>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <stdio.h>
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <iomanip>
+#include <Shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
 
-#define print(format, ...) fprintf(stderr, format, __VA_ARGS__)
+DWORD GetProcId(const char* pn, unsigned short int fi = 0b1101)
+{
+    DWORD procId = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
-// XOR Encryption/Obfuscation function
-std::string xorEncrypt(const std::string& data, char key) {
-    std::string result = data;
-    for (size_t i = 0; i < data.length(); ++i) {
-        result[i] = data[i] ^ key; // XOR with the key
+    if (hSnap != INVALID_HANDLE_VALUE)
+    {
+        PROCESSENTRY32 pE;
+        pE.dwSize = sizeof(pE);
+
+        if (Process32First(hSnap, &pE))
+        {
+            if (!pE.th32ProcessID)
+                Process32Next(hSnap, &pE);
+            do
+            {
+                if (fi == 0b10100111001)
+                    std::cout << pE.szExeFile << u8"\x9\x9\x9" << pE.th32ProcessID << std::endl;
+                if (!_stricmp(pE.szExeFile, pn))
+                {
+                    procId = pE.th32ProcessID;
+                    std::cout << "Process : 0x" << std::hex << pE.th32ProcessID << std::endl;
+                    break;
+                }
+            } while (Process32Next(hSnap, &pE));
+        }
     }
-    return result;
+    CloseHandle(hSnap);
+    return procId;
 }
 
-// Decrypt function (for encrypted data)
-std::string xorDecrypt(const std::string& data, char key) {
-    return xorEncrypt(data, key); // XOR decryption is same as encryption
-}
+BOOL InjectDLL(DWORD procID, const char* dllPath)
+{
+    BOOL WPM = 0;
 
-// Inject the shared object (SO) into the target process
-void InjectLibrary(pid_t target_pid, const char* library_path) {
-    // Attach to the target process
-    if (ptrace(PTRACE_ATTACH, target_pid, NULL, NULL) == -1) {
-        perror("ptrace attach");
-        exit(EXIT_FAILURE);
-    }
-    waitpid(target_pid, NULL, 0); // Wait for the process to stop
-
-    // Find the address of dlopen() in the target process (used to load the shared object)
-    void* dlopen_addr = dlsym(RTLD_DEFAULT, "dlopen");
-    if (!dlopen_addr) {
-        perror("dlsym dlopen");
-        exit(EXIT_FAILURE);
-    }
-
-    // Allocate memory in the target process for the library path
-    size_t path_len = strlen(library_path) + 1;
-    void* remote_addr = mmap(NULL, path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (remote_addr == MAP_FAILED) {
-        perror("mmap");
-        exit(EXIT_FAILURE);
-    }
-
-    // Write the encrypted library path to the allocated memory in the target process
-    std::string encryptedPath = xorEncrypt(library_path, 0xAA);  // XOR encryption (basic obfuscation)
-    if (ptrace(PTRACE_POKETEXT, target_pid, remote_addr, encryptedPath.c_str()) == -1) {
-        perror("ptrace POKETEXT");
-        exit(EXIT_FAILURE);
-    }
-
-    // Execute dlopen() in the target process with the library path
-    struct iovec remote_iov = {&dlopen_addr, sizeof(dlopen_addr)};
-    if (ptrace(PTRACE_POKETEXT, target_pid, remote_iov.iov_base, remote_iov.iov_len) == -1) {
-        perror("ptrace POKETEXT");
-        exit(EXIT_FAILURE);
-    }
-
-    // Detach from the target process and let it continue
-    ptrace(PTRACE_DETACH, target_pid, NULL, NULL);
-
-    print("Successfully injected the library into process %d\n", target_pid);
-}
-
-// Function to get the PID of a process by name (can be obfuscated with XOR as well)
-pid_t GetProcessId(const std::string& process_name) {
-    std::string xor_name = xorEncrypt(process_name, 0xAA); // XOR obfuscation
-    std::string command = "pgrep " + xor_name;
-    FILE* fp = popen(command.c_str(), "r");
-    if (fp == nullptr) {
-        perror("popen");
+    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, 0, procID);
+    if (hProc == INVALID_HANDLE_VALUE)
+    {
         return -1;
     }
-
-    char pid_buffer[10];
-    if (fgets(pid_buffer, sizeof(pid_buffer), fp) != nullptr) {
-        pid_t pid = atoi(pid_buffer);
-        fclose(fp);
-        return pid;
+    void* loc = VirtualAllocEx(hProc, 0, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    WPM = WriteProcessMemory(hProc, loc, dllPath, strlen(dllPath) + 1, 0);
+    if (!WPM)
+    {
+        CloseHandle(hProc);
+        return -1;
     }
-
-    fclose(fp);
-    return -1;
+    std::cout << "DLL Injected Successfully 0x" << std::hex << WPM << std::endl;
+    HANDLE hThread = CreateRemoteThread(hProc, 0, 0, (LPTHREAD_START_ROUTINE)LoadLibraryA, loc, 0, 0);
+    if (!hThread)
+    {
+        VirtualFree(loc, strlen(dllPath) + 1, MEM_RELEASE);
+        CloseHandle(hProc);
+        return -1;
+    }
+    std::cout << "Thread Created Successfully 0x" << std::hex << hThread << std::endl;
+    CloseHandle(hProc);
+    VirtualFree(loc, strlen(dllPath) + 1, MEM_RELEASE);
+    CloseHandle(hThread);
+    return 0;
 }
 
-int main() {
-    // Obfuscated inputs (using XOR encryption for hiding strings)
-    std::string encrypted_process_name, encrypted_library_path;
+int wmain(void)
+{
+    std::string pname, dllpath;
+    std::cout << "Process name (The name of process to inject): ";
+    std::cin >> pname;
+    std::cout << "DLL path (Full path to the desired DLL): ";
+    std::cin >> dllpath;
+    system("cls");
 
-    // Taking user input for process name and shared library path
-    print("Enter the name of the process (e.g., 'firefox') to inject into: ");
-    std::cin >> encrypted_process_name;
-    print("Enter the full path of the shared object to inject (e.g., '/home/user/mylib.so'): ");
-    std::cin >> encrypted_library_path;
-
-    // Decrypt the inputs
-    std::string decrypted_process_name = xorDecrypt(encrypted_process_name, 0xAA);
-    std::string decrypted_library_path = xorDecrypt(encrypted_library_path, 0xAA);
-
-    // Check if the library path exists
-    if (access(decrypted_library_path.c_str(), F_OK) == -1) {
-        print("Library file does not exist! Exiting...\n");
+    if (PathFileExists(dllpath.c_str()) == FALSE)
+    {
+        std::cout << "DLL File does NOT exist!" << std::endl;
         return EXIT_FAILURE;
     }
-
-    // Find the process ID for the target process
-    pid_t target_pid = GetProcessId(decrypted_process_name);
-    if (target_pid == -1) {
-        print("Process not found!\n");
-        return EXIT_FAILURE;
+    DWORD procId = 0;
+    procId = GetProcId(pname.c_str());
+    if (procId == NULL)
+    {
+        std::cout << "Process Not found (0x" << std::hex << GetLastError() << ")" << std::endl;
+        std::cout << "Here is a list of available processes." << std::endl;
+        Sleep(3500);
+        system("cls");
+        GetProcId("skinjbir", 0b10100111001);
     }
+    else
+        InjectDLL(procId, dllpath.c_str());
 
-    // Inject the library into the target process
-    InjectLibrary(target_pid, decrypted_library_path.c_str());
-
+    system("pause");
     return EXIT_SUCCESS;
 }
